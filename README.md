@@ -127,7 +127,7 @@ Tokenisation:
 These tests collectively validate the architectural requirements described in Sections 4.1–4.5 of the implementation report.
 
 ---
-## Optional: Logging & CHeckpoiting Infrastructure
+## Optional: Logging & Checkpoiting Infrastructure
 This reproduction includes optional training-infrastructure components adapted from the NanoChat execution layer:
 
 - Structured JSON logging
