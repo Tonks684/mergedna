@@ -10,9 +10,10 @@ eval_bundle/
 cache/
 runs/
 wandb/
+tests/__pycache__/
 # Secrets
 .env
-
+checkpoints/
 # Local setup
 CLAUDE.md
 wandb/
