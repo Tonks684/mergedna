@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as F
 
 try:
-    from nanochat.flash_attention import flash_attn as _nanochat_flash  # reuse FA3/SDPA dispatch
+    from nanochat_infra.flash_attention import flash_attn as _nanochat_flash  # reuse FA3/SDPA dispatch
 except Exception:
     _nanochat_flash = None
 

@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from nanochat.flash_attention import flash_attn
+from nanochat_infra.flash_attention import flash_attn
 
 def rmsnorm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     # Parameter-free RMSNorm (nanochat style). Small param differences are negligible vs 380M scale.
