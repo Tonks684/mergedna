@@ -1,7 +1,7 @@
 
 # MergeDNA Reproduction (with NanoChat Infrastructure Layer)
 
-This repository contains a modular reproduction of the **MergeDNA** architecture using selected infrastructure components from **NanoChat** as a Transformer backbone and attention execution layer.
+This repository contains a modular reproduction of the [**MergeDNA**](https://arxiv.org/abs/2511.14806) architecture using selected infrastructure components from [**NanoChat**](https://github.com/karpathy/nanochat) as a Transformer backbone and attention execution layer.
 
 Rather than modifying NanoChat directly, this implementation wraps and extends NanoChat’s:
 - Transformer encoder blocks
