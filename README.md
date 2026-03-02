@@ -112,7 +112,7 @@ Tokenisation:
 
 | Report Section | Test File |
 |---------------|-----------|
-| 4.1–4.2 Non-causal + Local Attention | `tests/test_41_42_attention_backend.py` |
+| 4.1 - 4.2 Non-causal + Local Attention | `tests/test_41_42_attention_backend.py` |
 | 4.3 Token Merge + Sparse S | `tests/test_43_local_merge_sparse_S.py` |
 | 4.4 Latent Merge (L→K) | `tests/test_44_latent_merge_grouping.py` |
 | 4.5 AMTM Sampler | `tests/test_45_amtm_sampler.py` |
