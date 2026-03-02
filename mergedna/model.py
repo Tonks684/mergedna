@@ -7,7 +7,7 @@ from mergedna.amtm import AMTMMaskSampler, AMTMCfg
 from mergedna.config import MergeDNAConfig
 from mergedna.dna_vocab import VOCAB
 from mergedna.transformer import EncoderConfig, TransformerEncoder, rmsnorm
-from mergedna.local_merge import LocalMergeConfig, LocalTokenMerger
+from mergedna.local_merge import LocalMergeConfig, LocalTokenMerger, unmerge_tokens
 
 class LocalEncoder(nn.Module):
     def __init__(self, cfg: MergeDNAConfig):
@@ -34,7 +34,7 @@ class LocalEncoder(nn.Module):
 
         z = self.enc(x_emb)
         # token counts are still N here. We merge down to target_L.
-        z_L, lengths_L = self.merger(z, lengths, target_len=target_L)
+        z_L, lengths_L, starts_new = self.merger(z, lengths, target_len=target_L)
         return z_L, lengths_L
 
 class LatentEncoder(nn.Module):
@@ -134,9 +134,8 @@ class LocalDecoder(nn.Module):
         lengths_L: (B,L) sum to N
         Returns logits over base vocab: (B,N,V)
         """
-        # Unmerge by repeating token embeddings across their base lengths
-        zN = torch.repeat_interleave(z_L_hat, lengths_L, dim=1)  # (B,N,D) if lengths sum to N
-        zN = zN[:, :N, :]  # safety
+        # Unmerge merged-token embeddings back to base resolution
+        zN = unmerge_tokens(z_L_hat, lengths_L, N)  # (B,N,D)
         zN = self.dec(zN)
         return self.head(rmsnorm(zN))
 
