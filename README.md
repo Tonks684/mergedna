@@ -1,7 +1,7 @@
 
 # MergeDNA Reproduction (with NanoChat Infrastructure Layer)
 
-This repository contains a modular reproduction of the **MergeDNA** architecture using selected infrastructure components from **NanoChat** as a Transformer backbone and attention execution layer.
+This repository contains a modular reproduction of the [**MergeDNA**](https://arxiv.org/abs/2511.14806) architecture using selected infrastructure components from [**NanoChat**](https://github.com/karpathy/nanochat) as a Transformer backbone and attention execution layer.
 
 Rather than modifying NanoChat directly, this implementation wraps and extends NanoChat’s:
 - Transformer encoder blocks
@@ -72,7 +72,12 @@ docker compose build
 docker compose run --rm mergedna-dev pytest -q
 ```
 
-3. Run smoke pre-training (synthetic):
+3a. Run smoke pre-training (synthetic) using --tiny for speed:
+
+```bash
+docker compose run --rm mergedna-dev python scripts/pretrain_smoke.py --dataset synthetic --steps 50 --tiny
+```
+3b. Run smoke pre-training (synthetic):
 
 ```bash
 docker compose run --rm mergedna-dev python scripts/pretrain_smoke.py --dataset synthetic --steps 50
@@ -122,6 +127,41 @@ Tokenisation:
 These tests collectively validate the architectural requirements described in Sections 4.1–4.5 of the implementation report.
 
 ---
+## Optional: Logging & Checkpoiting Infrastructure
+This reproduction includes optional training-infrastructure components adapted from the NanoChat execution layer:
+
+- Structured JSON logging
+- Throughput monitoring
+- Checkpoint save / resume
+- Weights & Biases experiment tracking (optional)
+
+These components are not required to run the architectural reproduction described in Sections 4.1–4.5 of the implementation report.
+
+By default:
+
+- Logging is enabled locally
+- Checkpointing is enabled via --ckpt-every
+- W&B tracking is disabled unless explicitly requested
+
+W&B can be enabled in:
+
+- `offline mode` (local logging only)
+- `online mode` (requires wandb install)
+
+Example:
+```docker compose run --rm mergedna-dev \
+python scripts/pretrain_smoke.py \
+--tiny \
+--steps 50 \
+--wandb offline
+```
+To enable W&B online tracking:
+
+`uv sync --extra wandb`
+
+If W&B is not installed, logging will be automatically disabled without affecting model execution.
+
+These infrastructure components are provided solely for training observability and do not modify the MergeDNA modelling pipeline.
 
 ## Running Outside Docker (Optional)
 
