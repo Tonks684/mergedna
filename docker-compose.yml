@@ -1,0 +1,11 @@
+services:
+  mergedna-dev:
+    build:
+      context: .
+      target: dev
+    volumes:
+      - .:/workspace
+    working_dir: /workspace
+    environment:
+      - PYTHONPATH=/workspace
+    command: bash

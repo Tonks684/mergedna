@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+dev-ignore/
+report.md
+eval_bundle/
+.pytest_cache/
+cache/
+runs/
+wandb/
+# Secrets
+.env
+
+# Local setup
+CLAUDE.md
+wandb/

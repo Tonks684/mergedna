@@ -1,0 +1,12 @@
+cat > .dockerignore <<'TXT'
+.git
+**/__pycache__/
+**/*.pyc
+.venv
+.vscode
+.idea
+.ipynb_checkpoints
+runs
+report
+docs
+TXT
