@@ -4,11 +4,15 @@ from __future__ import annotations
 import argparse
 import torch
 import torch.nn.functional as F
+from pathlib import Path
 
 from mergedna.model import MergeDNA
 from mergedna.config import MergeDNAConfig
 from mergedna.dna_vocab import VOCAB
+from mergedna.infra.logging import make_run_logger, ThroughputMeter
+from mergedna.infra.checkpoint import save_checkpoint, load_checkpoint
 
+from mergedna.infra.wandb_logger import WandbLogger, WandbConfig
 print(f'[pretrain_smoke] import ok', flush=True)
 
 # ---------------------------------------------------------
@@ -102,14 +106,29 @@ def training_step(model, x, cfg, device):
 # Main
 # ---------------------------------------------------------
 
+from pathlib import Path
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps", type=int, default=50)
     parser.add_argument("--batch", type=int, default=2)
     parser.add_argument("--dataset", type=str, default="synthetic")
     parser.add_argument("--tiny", action="store_true")
+
+    parser.add_argument("--ckpt-every", type=int, default=10)
+    parser.add_argument("--ckpt-dir", type=str, default="checkpoints/pretrain_smoke")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pt to resume from")
+
+    parser.add_argument("--wandb", type=str, default="disabled", choices=["disabled", "offline", "online"])
+    parser.add_argument("--wandb-project", type=str, default="mergedna-smoke")
+    parser.add_argument("--wandb-name", type=str, default=None)
+
     args = parser.parse_args()
-    print(f'[pretrain_smoke] args={args}', flush=True)
+
+    logger = make_run_logger(run_id="pretrain_smoke", enable_file=True, enable_print=True)
+    tput = ThroughputMeter()
+
+    print(f"[pretrain_smoke] args={args}", flush=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     cfg = MergeDNAConfig()
@@ -119,6 +138,7 @@ def main():
         cfg.n_heads = 4
         cfg.n_local_enc = 1
         cfg.n_latent_enc = 1
+        cfg.n_latent_dec = 1
         cfg.n_local_dec = 1
         cfg.L_avg = 128
         cfg.K_avg = 64
@@ -132,36 +152,56 @@ def main():
         weight_decay=1e-8,
     )
 
-    for step in range(args.steps):
+    # W&B mirror (optional)
+    wb = WandbLogger(WandbConfig(
+        mode=args.wandb,
+        project=args.wandb_project,
+        name=args.wandb_name,
+        tags=["smoke"],
+        run_dir=str(Path("runs") / "wandb"),
+    ))
 
-        x = make_synthetic_batch(
-            args.batch,
-            cfg.N,
-            device,
-        )
+    start_step = 0
+    if args.resume is not None:
+        meta = load_checkpoint(args.resume, model=model, optimizer=opt, map_location=device)
+        start_step = int(meta.get("step") or 0) + 1
+
+    for step in range(start_step, args.steps):
+        x = make_synthetic_batch(args.batch, cfg.N, device)
 
         opt.zero_grad()
-
-        loss, lmtr, llat, lamtm = training_step(
-            model,
-            x,
-            cfg,
-            device,
-        )
-
+        loss, lmtr, llat, lamtm = training_step(model, x, cfg, device)
         loss.backward()
         opt.step()
 
         if step % 10 == 0:
-            print(
-                f"step={step} "
-                f"loss_mtr={lmtr.item():.4f} "
-                f"loss_latent={llat.item():.4f} "
-                f"loss_amtm={lamtm.item():.4f}",
-                flush=True,
+            tokens = int(x.numel())
+            tput_metrics = tput.update(tokens)
+
+            payload = logger.log(
+                step,
+                loss=float(loss.item()),
+                loss_mtr=float(lmtr.item()),
+                loss_latent=float(llat.item()),
+                loss_amtm=float(lamtm.item()),
+                device=device,
+                batch=int(args.batch),
+                seq_len=int(cfg.N),
+                **tput_metrics,
             )
-    print(f'[pretrain_smoke] training complete', flush=True)
+            wb.log(payload, step=step)
 
+        if args.ckpt_every > 0 and step % args.ckpt_every == 0 and step > 0:
+            save_checkpoint(
+                Path(args.ckpt_dir) / f"ckpt_step{step}.pt",
+                model=model,
+                optimizer=opt,
+                step=step,
+                cfg=cfg,
+            )
 
+    wb.finish()
+    print("[pretrain_smoke] training complete", flush=True)
+    
 if __name__ == "__main__":
     main()
