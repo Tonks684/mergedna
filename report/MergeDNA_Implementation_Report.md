@@ -175,7 +175,7 @@ Trade-off:
 - Reduces global receptive field within Local Encoder blocks
 - Optimized FlashAttention execution is preserved when available via NanoChat’s runtime dispatch.
 ---
-#### 4.3 Token Merging + Segmentation Mapping
+### 4.3 Token Merging + Segmentation Mapping
 
 MergeDNA’s Local Encoder performs local token merging and produces both a compressed token sequence $(Z_L)$ and a segmentation-tracking structure $(S)$ that supports reconstruction and mask projection back to base resolution.
 
@@ -183,6 +183,9 @@ Rather than materialising the paper’s dense binary source matrix $(S \in \{0,1
 
 1) **Unmerge** of embeddings back to base resolution  
 2) **Projection** of merged-token masks back to base masks (required by AMTM)
+
+
+Materialising the paper’s dense $(S)$ is unnecessary and impractical for long sequences because each merged token corresponds to a contiguous span of tokens determined by token lengths and token starts.
 
 #### Implementation locations
 
@@ -197,15 +200,17 @@ Segmentation is represented by two per-token vectors:
 - `token_lens` $(\in \mathbb{Z}^{B \times L})$: base span length covered by each merged token  
 - `token_starts` $(\in \mathbb{Z}^{B \times L})$: base start index for each merged token span  
 
-This representation is memory-efficient $(O(L)$ rather than $O(LN))$ and fully defines a contiguous segmentation under adjacent-pair merges.
+This representation is memory-efficient $(O(L)$ rather than $O(LN))$ while preserving exact reconstruction and masking behaviour, as validated by unit tests that compare against a dense $(S)$ reference for small sequences.
 
 
 #### Merge behaviour
 
-Within each local window, the merger computes adjacency similarity in a learned grouping space and selects a set of **non-overlapping adjacent pairs** to merge, subject to a target length \(L\) (merge budget). Merges are applied as a span-weighted average:
+Within each local window, the merger computes adjacency similarity in a learned grouping space and selects a set of **non-overlapping adjacent pairs** to merge, subject to a target length $(L)$ (merge budget). Merges are applied as a span-weighted average:
 
 - right token is merged into the left token embedding
 - lengths are accumulated to preserve span accounting (`token_lens`)
+
+Although the paper does not explicitly state the need for non-overlapping adjacent pairs it is a requirement for pairwise merging and is mentioned in the ToMe paper. Core idea being that each original token must belong to exactly one merged token therefore it cannot be merged twice.
 
 #### Unmerge and mask projection
 
@@ -214,104 +219,247 @@ Within each local window, the merger computes adjacency similarity in a learned 
 
 #### Trade-offs
 
-- **Pros:** avoids dense \(S\); deterministic and efficient unmerge/mask projection; clean integration into training loops.  
+- **Pros:** avoids dense $(S)$; deterministic and efficient unmerge/mask projection; clean integration into training loops.  
 - **Cons:** assumes merged groups are contiguous spans (valid for adjacent merges); if later variants introduce non-contiguous grouping, additional metadata would be required.
 
 ---
 
-### 4.4 Latent Bottleneck Pipeline (Global Merge L → K + Unmerge K → L)
+## 4.4 Latent Bottleneck Pipeline (Global Merge L → K + Unmerge K → L)
 
-MergeDNA’s latent reconstruction and AMTM objectives require a global compression stage over the locally-merged sequence $(Z_L)$, producing a shorter sequence $(Z_K)$ with $(K < L)$, together with a grouping structure $(S')$ that enables computation of group sizes for importance-based masking.
+MergeDNA’s latent reconstruction and AMTM objectives require a global compression stage over the locally merged sequence $Z_L$, producing a shorter latent sequence $Z_K$ with $K < L$, together with a grouping structure $S'$ used for reconstruction and importance-based masking.
 
-This implementation introduces a global merge operator that compresses $(L \rightarrow K)$ and returns a per-token group assignment vector that acts as a sparse representation of $(S')$.
+This implementation provides a faithful interface and training semantics for the latent bottleneck while approximating the paper’s ToMe-style merge with a deterministic anchor-based clustering procedure.
 
-#### Implementation locations
+### Implementation Locations
 
 - `mergedna/model.py::LatentEncoder.global_merge_to_K`
 - `mergedna/model.py::MergeDNA.forward_latent_reconstruct`
 
-#### Interface and outputs
-
-Given contextualised local tokens $(z_{L,\mathrm{ctx}} \in \mathbb{R}^{B \times L \times D})$:
-
-- `global_merge_to_K(z_L_ctx, K)` returns:
-  - `z_K` of shape `(B, K, D)` — global latent “salient” tokens
-  - `group_of_token` of shape `(B, L)` — maps each local token index to a group id in `[0, K-1]`
-
-This `group_of_token` provides the required grouping structure to compute per-group sizes $(g_i)$ for AMTM without materialising a dense $(S')$.
-
-#### Merge algorithm (current approximation)
-
-The paper describes a ToMe-style global merge. The current implementation provides a faithful *interface* and training semantics using an anchor-based hard clustering approximation:
-
-1. Project each token into a grouping space using a lightweight linear map:
-   - `g_raw = Linear(z_L_ctx)`
-2. Select $(K)$ anchors per batch as tokens with highest grouping-space norm:
-   - `topk(scores)`
-3. Assign each token to its nearest anchor by cosine similarity:
-   - `group_of_token = argmax(sim)`
-4. Compute each latent token embedding as the mean of its assigned members via `scatter_add_`.
-
-The assignment step is performed under `no_grad` (discrete), while the computation of `z_K` remains differentiable w.r.t. `z_L_ctx`.
-
-#### Unmerge K → L for latent reconstruction
-
-For the latent reconstruction pass, MergeDNA requires unmerging $(Z_K)$ back to length $(L)$ before decoding. This is implemented as a hard unmerge using the group assignments:
-
-- `z_bar_L[l] = z_K[group_of_token[l]]`
-
-implemented via `torch.gather`, producing `z_bar_L` of shape `(B, L, D)`.
-
-#### Trade-offs
-
-- **Pros:** provides the required $(L \rightarrow K)$ bottleneck, returns an explicit grouping structure for AMTM, keeps the rest of the architecture modular and swappable (ToMe can later replace this merge operator without changing downstream interfaces).
-- **Cons:** anchor-based grouping is an approximation of ToMe-style merging; group assignments are discrete and not differentiable. This is acceptable for the current scaffold, and the merge operator can be swapped to a ToMe implementation later while preserving the same `z_K` + `group_of_token` interface.
 ---
 
-#### 4.5 Adaptive Masked Token Modelling (AMTM)
+### Interface and Outputs
 
-AMTM defines a masking objective over base-resolution tokens, where the mask is adaptively sampled based on the latent merge grouping structure $(S')$. The key idea is to preferentially mask tokens that are less redundantly represented under the latent grouping.
+Given contextualized local tokens:
 
-#### Implementation locations
+$$
+z_{L,\mathrm{ctx}} \in \mathbb{R}^{B \times L \times D}
+$$
+
+`global_merge_to_K(z_L_ctx, K)` returns:
+
+- `z_K` of shape `(B, K, D)` — compressed latent tokens  
+- `group_of_token` of shape `(B, L)` — integer group assignments in `[0, K-1]`
+
+`group_of_token` is a sparse representation of the paper’s grouping structure $S'$:  
+each local token belongs to exactly one latent group.
+
+This structure is later used to compute group sizes $g_i$ for AMTM.
+
+---
+
+### Merge Algorithm (Anchor-Based Hard Clustering)
+
+The paper describes a ToMe-style global merging process. Here, I implement a simpler but semantically equivalent bottleneck with the following steps:
+
+#### 1. Learned Grouping Projection
+
+Each local token is projected into a lower-dimensional grouping space:
+
+$$
+g_{\text{raw}} = W_g z_{L,\mathrm{ctx}}
+$$
+
+The magnitude of this projection
+
+$$
+\|g_{\text{raw}}\|
+$$
+
+is interpreted as a learned saliency score. Tokens with larger magnitude are treated as structurally important candidates for latent anchors.
+Each column of $W_g$ can be viewed as detecting some structural pattern in the contextualised embedding eg. long-range interaction strength or motif boundary signals. If a token strongly activates many learned grouping directions $g_{raw}$ will have large magnitude thus norm measures how strongly the token activies learned grouping subspaces.
+
+#### 2. Anchor Selection
+
+For each batch element, the top-$K$ tokens by grouping-space magnitude are selected as anchors.
+
+This replaces ToMe’s pairwise merge scheduling with a deterministic selection of $K$ representative tokens. Selecting high-norm tokens ensures each latent token corresponds to a token the model considers salient in the learned grouping space.
+
+#### 3. Hard Assignment via Cosine Similarity
+
+All local tokens are assigned to their nearest anchor by cosine similarity:
+
+$$
+\text{group\_of\_token}[l] = \arg\max_k \langle g_l, g_{\text{anchor},k} \rangle
+$$
+
+This maps a continuous similarity vector to a discrete clusteing index.
+
+#### 4. Group Aggregation
+
+Latent tokens are computed as the mean of assigned local embeddings:
+
+$$
+z_K[k] = \frac{1}{g_k} \sum_{l \in \text{group}(k)} z_{L,\mathrm{ctx}}[l]
+$$
+
+implemented via `scatter_add_`.
+For a fixed grouping assignment, this operation is: additon, division, tensor indexing. All of these are differentiable.
+
+---
+
+### Gradient Semantics
+
+The group assignment step uses `argmax` and is therefore non-differentiable.  
+However, aggregation into $z_K$ remains differentiable with respect to $z_{L,\mathrm{ctx}}$.
+
+Thus:
+
+- Gradients flow through the latent bottleneck via group means.
+- Grouping decisions are treated as structural routing rather than continuously optimized soft clustering.
+
+This design mirrors many hard-routing architectures and preserves stable training dynamics while maintaining a true compression bottleneck.
+
+---
+
+### Unmerge (K → L)
+
+For latent reconstruction, $Z_K$ must be expanded back to local-token resolution prior to decoding.
+
+This is implemented as:
+
+$$
+\bar{z}_L[l] = z_K[\text{group\_of\_token}[l]]
+$$
+
+using `torch.gather`.
+
+This deterministic routing provides a clean reconstruction pathway without materializing dense grouping matrices.
+
+---
+
+### Trade-offs
+
+| Aspect | Benefit | Limitation |
+|--------|----------|------------|
+| Anchor-based grouping | Deterministic, simple, preserves L→K interface | Not identical to ToMe pairwise merging |
+| Hard assignment | Clear $S'$ structure, stable training | Non-differentiable grouping |
+| Mean aggregation | Fully differentiable latent representation | May reduce fine-grained merge flexibility |
+
+The merge operator is modular and can be replaced with a ToMe-style similarity merge or soft clustering variant without modifying downstream interfaces.
+
+---
+
+## 4.5 Adaptive Masked Token Modelling (AMTM)
+
+AMTM defines a masking objective over base-resolution tokens where mask probabilities are derived from the latent grouping structure $S'$.
+
+The key intuition is that tokens belonging to smaller latent groups represent more unique structural information and should be masked with higher probability.
+
+### Implementation Locations
 
 - `mergedna/amtm.py`
-    - `compute_amtm_probs_from_groups`
-    - `sample_exact_k_tokens`
-    - `AMTMMaskSampler`
+  - `compute_amtm_probs_from_groups`
+  - `sample_exact_k_tokens`
+  - `AMTMMaskSampler`
 - `mergedna/model.py::MergeDNA.forward_amtm`
 
-#### Group-driven mask distribution
+---
 
-Given latent grouping assignments `group_of_token ∈ [0..K-1]^(B×L)` produced by the global merge (Section 4.4), group sizes are computed per sample:
+### Group-Driven Mask Distribution
 
-- $(g_i = \text{count}(\text{group\_of\_token} = i))$
+Given latent grouping assignments:
 
-AMTM assigns per-token sampling probabilities over the L local tokens:
+$$
+\text{group\_of\_token} \in [0..K-1]^{B \times L}
+$$
 
-- $(w_i = 1 / g_i)$
-- $(P_L(j) ∝ w_i / g_i = 1/g_i^2)$ for token $(j)$ in group $(i)$
+Group sizes are computed per sample:
 
-Exactly $(K)$ local tokens are sampled *without replacement* according to $(P_L)$, yielding a merged-token mask `mask_L`.
+$$
+g_i = \text{count}(\text{group\_of\_token} = i)
+$$
 
-#### Projection to base resolution
+Per-token sampling weights are defined as:
 
-The merged-token mask `mask_L` is projected to base resolution `mask_N` using the sparse segmentation representation from Section 4.3 (run-length encoding via `lengths_L`), avoiding dense materialisation of the source matrix $(S)$.
+$$
+w_i = \frac{1}{g_i}
+$$
 
-#### AMTM forward pass semantics (no latent merge)
+and token probabilities follow:
 
-Per the paper, AMTM uses the latent grouping only to define the mask, and the prediction forward pass is run **without latent token merging**:
+$$
+P_L(j) \propto \frac{1}{g_i^2}
+$$
 
-- `x_masked → forward_reconstruct(x_masked, target_L)`  
+for token $j$ in group $i$.
 
-Masked base tokens are replaced with the explicit `[MASK]` token (`VOCAB.MASK`). The AMTM loss is computed as cross-entropy **only at masked base positions** (optionally excluding ambiguous targets `VOCAB.N`).
+Thus, tokens in smaller groups (low redundancy) receive higher masking probability.
 
-#### Trade-offs
+---
 
-- **Pros:** importance sampling focuses supervision on informative (less-merged) regions; grouping-derived masks are consistent with the model’s hierarchical structure.
-- **Cons:** introduces additional sampling and mask-projection complexity; objective becomes dependent on the quality of latent grouping $(S')$.
+### Exact-K Sampling
+
+Exactly $K$ local tokens are sampled without replacement according to $P_L$.
+
+This ensures:
+
+- Stable training signal magnitude per batch
+- Deterministic mask count
+- No duplicate sampling
+
+The resulting boolean mask over local tokens is `mask_L ∈ {0,1}^{B×L}`.
+
+---
+
+### Projection to Base Resolution
+
+The merged-token mask `mask_L` is projected to base resolution using the sparse segmentation representation (run-length encoding via `lengths_L`), avoiding dense materialization of the source matrix $S$.
+
+This yields:
+
+$$
+\text{mask}_N \in \{0,1\}^{B \times N}
+$$
+
+---
+
+### AMTM Forward Semantics
+
+Per the paper, AMTM uses latent grouping only to define which tokens to mask.
+
+The prediction forward pass is executed **without latent merging**:
+
+$$
+x_{\text{masked}} \rightarrow \text{forward\_reconstruct}(x_{\text{masked}}, L)
+$$
+
+Masked base tokens are replaced with the explicit `[MASK]` token from the DNA vocabulary.
+
+The loss is computed as cross-entropy **only at masked base positions**, optionally excluding ambiguous targets.
+
+---
+
+### Design Rationale
+
+- Importance-based masking focuses supervision on structurally unique regions.
+- Masking depends only on grouping structure, not on prediction logits.
+- The forward pass excludes latent compression, aligning exactly with the paper’s objective formulation.
+
+---
+
+### Trade-offs
+
+| Aspect | Benefit | Limitation |
+|--------|----------|------------|
+| Importance sampling | Targets informative regions | Dependent on grouping quality |
+| Exact-K masking | Stable optimization | Adds sampling complexity |
+| Sparse mask projection | Memory efficient | Assumes contiguous span merges |
+
+AMTM therefore integrates naturally with the latent bottleneck while preserving architectural modularity.
 
 
 The correctness of Sections 4.1-4.5 is validated via unit tests aligned explicitly to each architectural component (see repository Test ↔ Report Section Mapping)
+
 ---
 
 ## 5. Training Pipeline Adaptation
@@ -325,8 +473,46 @@ Training loop modified to support:
 Compression-ratio sampling implemented by dynamically sampling L per iteration: $L ∼ 𝒩(N/2, σ²)$
 
 ---
+## 6. Parameter Accounting (~380M parameters)
+The configuration used in this implementation corresponds to the ~380M parameter setting described in Section 4 of the paper. The dominant contribution to parameter count arises from the Transformer blocks.
 
-## 6. Execution Guarantees Preserved
+The architecture comprises:
+- 4 Local Encoder blocks
+- 20 Latent Encoder blocks
+- 4 Latent Decoder blocks
+- 2 Local Decoder blocks
+
+forming a total of 30 Transformer blocks.
+
+Each block uses:
+
+- Model width: 𝑑𝑚𝑜𝑑𝑒𝑙 = 1024
+- Multi-head attention with 16 heads (head dimension = 64)
+- Feedforward hidden size: 𝑑𝑓𝑓 = 4 × 𝑑𝑚𝑜𝑑𝑒𝑙 = 4096
+
+Assuming a standard Transformer block with separate $𝑊𝑞,𝑊𝑘,𝑊𝑣,𝑊𝑜$ projections and a two-layer FFN:
+
+Attention parameters per block:
+4 × 1024 × 1024 ≈ 4.2𝑀
+
+FFN parameters per block:
+1024 × 4096 + 4096 × 1024 ≈ 8.4𝑀
+
+Total per block:
+≈ 12.6𝑀
+
+Across 30 blocks:
+30 × 12.6𝑀 ≈ 378𝑀
+
+Layer normalization parameters, token embeddings, and small projection layers used for local and global merging account for the remaining parameters, bringing the total close to the paper’s reported ~380M scale.
+
+This estimate assumes:
+- Standard two-layer FFNs (no gated MLP variants),
+- Independent parameter sets for local and latent stacks (no weight sharing),
+- Standard QKV attention projections.
+
+---
+## 7. Execution Guarantees Preserved
 
 The following NanoChat execution guarantees were preserved:
 
@@ -338,7 +524,7 @@ The following NanoChat execution guarantees were preserved:
 
 ---
 
-## 7. Design Trade-offs
+## 8. Design Trade-offs
 
 | Design Choice | Benefit | Cost |
 |--------------|--------|------|
@@ -348,7 +534,7 @@ The following NanoChat execution guarantees were preserved:
 
 ---
 
-## 8. Extensibility
+## 9. Extensibility
 
 This modular separation enables:
 

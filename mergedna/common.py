@@ -109,7 +109,7 @@ def print_banner():
 /_/  /_/\___/_/   \__, /\___/  /_____/_/ |_/_/  |_|      
                  /____/                                  
     """
-    print0(banner)
+    print(banner)
 
 def is_ddp_requested() -> bool:
     """

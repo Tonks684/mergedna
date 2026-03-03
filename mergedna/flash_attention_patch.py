@@ -3,7 +3,7 @@ MergeDNA attention backend (Report §4.1 - §4.2).
 
 What this module does
 ---------------------
-MergeDNA needs *encoder-style* attention, not autoregressive decoding. Concretely:
+MergeDNA needs encoder-style attention, not autoregressive decoding. Concretely:
 
   §4.1 Non-causal attention:
     - reconstruction-style passes (MTR, AMTM) require is_causal=False
@@ -15,8 +15,8 @@ Rather than re-implementing attention kernels, I treat NanoChat as an execution 
   - If NanoChat's FlashAttention wrapper is available, I reuse its runtime dispatch
     (FA2/FA3/SDPA) while passing through `causal` and `window_size`.
   - Otherwise I fall back to PyTorch's scaled_dot_product_attention (SDPA), using:
-      * is_causal for true causal masking
-      * a boolean attention mask for sliding-window locality
+      - is_causal for true causal masking
+      - a boolean attention mask for sliding-window locality
 
 Tensor layout conventions
 -------------------------
@@ -155,8 +155,8 @@ def flash_attn_func(
         - If NanoChat infra is available, delegate to its attention backend so that
           FlashAttention/SDPA selection happens there.
         - Otherwise, execute torch SDPA:
-            * fast path for full attention with equal lengths
-            * masked path for local windows and/or unequal lengths
+            - fast path for full attention with equal lengths
+            - masked path for local windows and/or unequal lengths
 
     Note:
         This function is intentionally minimal: it is the glue between MergeDNA's
