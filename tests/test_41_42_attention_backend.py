@@ -4,6 +4,10 @@ import torch.nn.functional as F
 import mergedna.flash_attention_patch as fa_patch
 from mergedna.flash_attention_patch import flash_attn_func
 
+from mergedna.config import MergeDNAConfig
+from mergedna.model import LocalEncoder, LocalDecoder
+from mergedna.dna_vocab import VOCAB
+
 
 def _naive_attention_reference(q, k, v, *, causal: bool, window_size):
     """
@@ -41,6 +45,10 @@ def _naive_attention_reference(q, k, v, *, causal: bool, window_size):
     out = torch.einsum("bhts,bhsd->bhtd", attn, vh)
     return out.transpose(1, 2)  # (B,Tq,H,Dh)
 
+
+# ---------------------------------------------------------------------------
+# Backend correctness tests (existing)
+# ---------------------------------------------------------------------------
 
 def test_flash_attn_patch_forced_sdpa_matches_naive_noncausal_full(monkeypatch):
     torch.manual_seed(0)
@@ -108,3 +116,77 @@ def test_flash_attn_patch_backward_pass(monkeypatch):
     assert torch.isfinite(q.grad).all()
     assert torch.isfinite(k.grad).all()
     assert torch.isfinite(v.grad).all()
+
+
+# ---------------------------------------------------------------------------
+# NEW: Transformer-level local-window enforcement tests
+# ---------------------------------------------------------------------------
+
+def test_local_encoder_and_decoder_propagate_window_size_into_transformer():
+    """
+    Ensures the *model* actually uses local-window attention, not just the token-merger.
+    This catches the regression where SelfAttention hard-coded window_size=(-1,-1).
+    """
+    cfg = MergeDNAConfig()
+    cfg.N = 128
+    cfg.d_model = 64
+    cfg.n_heads = 4
+    cfg.ffn_mult = 2
+    cfg.n_local_enc = 2
+    cfg.n_local_dec = 2
+    cfg.local_window_size = 8
+
+    enc = LocalEncoder(cfg)
+    dec = LocalDecoder(cfg)
+
+    expected = (cfg.local_window_size, cfg.local_window_size)
+
+    # LocalEncoder transformer stack should be local-window
+    for blk in enc.enc.blocks:
+        assert getattr(blk.attn.cfg, "attn_window_size", (-1, -1)) == expected
+
+    # LocalDecoder transformer stack should be local-window (paper says local modules are windowed)
+    for blk in dec.dec.blocks:
+        assert getattr(blk.attn.cfg, "attn_window_size", (-1, -1)) == expected
+
+
+def test_local_window_attention_blocks_far_token_influence(monkeypatch):
+    """
+    Behavioural test: with SDPA forced, modifying a far-away token should not affect
+    an interior position if it's outside the local window.
+
+    This is intentionally lightweight and avoids needing an explicit dense mask over the whole model.
+    """
+    torch.manual_seed(0)
+    monkeypatch.setattr(fa_patch, "_nanochat_flash", None)
+
+    cfg = MergeDNAConfig()
+    cfg.N = 96
+    cfg.d_model = 64
+    cfg.n_heads = 4
+    cfg.ffn_mult = 2
+    cfg.n_local_enc = 1   # keep tiny for test speed
+    cfg.local_window_size = 4
+
+    enc = LocalEncoder(cfg).eval()
+
+    B, N, D = 1, cfg.N, cfg.d_model
+    x1 = torch.randn(B, N, D)
+    x2 = x1.clone()
+
+    # Choose a "query" position i well inside the sequence and a "far" position j
+    # outside its attention window.
+    i = 40
+    j = 40 + (cfg.local_window_size + 10)  # definitely outside +/- window
+
+    # Perturb the far token heavily
+    x2[:, j, :] += 10.0
+
+    with torch.no_grad():
+        # target_L == N ensures the merger is a no-op; we are testing attention locality only.
+        z1, _ = enc(x1, target_L=N)
+        z2, _ = enc(x2, target_L=N)
+
+    # If local-window is enforced, position i should be (nearly) unchanged by far perturbation
+    # Tolerance is small but nonzero due to numerical differences.
+    assert torch.allclose(z1[:, i, :], z2[:, i, :], atol=1e-5, rtol=1e-4)

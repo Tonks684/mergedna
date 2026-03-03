@@ -32,6 +32,7 @@ class LocalEncoder(nn.Module):
             n_layers=cfg.n_local_enc,
             ffn_mult=cfg.ffn_mult,
             max_seq_len=cfg.N,
+            attn_window_size=(cfg.local_window_size, cfg.local_window_size),
         )
         self.enc = TransformerEncoder(enc_cfg)
         self.merger = LocalTokenMerger(cfg.d_model, LocalMergeConfig(window_size=cfg.local_window_size))
@@ -279,6 +280,7 @@ class LocalDecoder(nn.Module):
             n_layers=cfg.n_local_dec,
             ffn_mult=cfg.ffn_mult,
             max_seq_len=cfg.N,
+            attn_window_size=(cfg.local_window_size, cfg.local_window_size),
         )
         self.dec = TransformerEncoder(dec_cfg)
         self.head = nn.Linear(cfg.d_model, VOCAB.size, bias=False)
