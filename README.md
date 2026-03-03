@@ -16,10 +16,7 @@ to support the hierarchical tokenisation and adaptive masking procedures require
 ## Documentation Map
 
 - `report/MergeDNA_Implementation_Report.md`  
-  Canonical description of design decisions and mapping to paper sections (4.1–4.5)
-
-- `docs/infra_notes/`  
-  Supporting infrastructure notes (e.g., SDPA/FA dispatch)
+  This report is a detailed description of design decisions (sections 4.1–4.5,5.0) that map to the information provided about the MergeDNA implementation in the paper. 
 
 - `tests/`  
   Unit tests aligned to report sections
@@ -60,7 +57,7 @@ docker-compose.yml
 
 ---
 
-## How to Review this Submission
+## Quickstart
 
 1. Read the implementation report:
    - `report/MergeDNA_Implementation_Report.md`
@@ -71,13 +68,27 @@ docker-compose.yml
 docker compose build
 docker compose run --rm mergedna-dev pytest -q
 ```
+---
 
-3a. Run smoke pre-training (synthetic) using --tiny for speed:
+3. Optional: Running Outside Docker
+
+```bash
+pip install uv
+uv sync
+pytest -q
+```
+
+Docker execution is recommended to ensure matching dependency versions.
+
+---
+
+
+4. Run smoke pre-training (synthetic) using --tiny for speed:
 
 ```bash
 docker compose run --rm mergedna-dev python scripts/pretrain_smoke.py --dataset synthetic --steps 50 --tiny
 ```
-3b. Run smoke pre-training (synthetic):
+5. Run smoke pre-training (synthetic) (default: larger sequence length and model width):
 
 ```bash
 docker compose run --rm mergedna-dev python scripts/pretrain_smoke.py --dataset synthetic --steps 50
@@ -91,12 +102,10 @@ step=10 loss_mtr=... loss_latent=... loss_amtm=...
 
 This verifies that:
 - MTR pass
-- Latent-MTR pass (local encoder frozen)
-- AMTM pass
+- Latent-MTR pass
+- AMTM pass execute end-to-end without error
+- Three forward passes execute successfully
 
-execute end-to-end without error.
-
----
 
 ## Optional: HuggingFace Dataset Streaming
 
@@ -124,56 +133,26 @@ Tokenisation:
 | 4.5 AMTM Forward Contract | `tests/test_45_amtm_forward_contract.py` |
 | 5.x Three-Pass Training | `tests/test_5xx_three_pass_training_contract.py` |
 
-These tests collectively validate the architectural requirements described in Sections 4.1–4.5 of the implementation report.
+These tests collectively validate the architectural requirements described in Sections 4.1–4.5 and 5.0 of the implementation report.
 
----
-## Optional: Logging & Checkpoiting Infrastructure
-This reproduction includes optional training-infrastructure components adapted from the NanoChat execution layer:
 
-- Structured JSON logging
-- Throughput monitoring
-- Checkpoint save / resume
-- Weights & Biases experiment tracking (optional)
-
-These components are not required to run the architectural reproduction described in Sections 4.1–4.5 of the implementation report.
-
-By default:
-
-- Logging is enabled locally
-- Checkpointing is enabled via --ckpt-every
-- W&B tracking is disabled unless explicitly requested
-
-W&B can be enabled in:
-
-- `offline mode` (local logging only)
-- `online mode` (requires wandb install)
-
-Example:
-```docker compose run --rm mergedna-dev \
-python scripts/pretrain_smoke.py \
---tiny \
---steps 50 \
---wandb offline
+## Short Architectural Overview
 ```
-To enable W&B online tracking:
+Base Tokens (N)
+   ↓ (4.1 / 4.2)
+Local Encoder + Token Merge (4.3)
+   ↓  N → L
+Latent Encoder + Global Merge (4.4)
+   ↓  L → K
+Latent Decoder
+   ↓
+Local Decoder + Unmerge (4.3)
+   ↓
+Base Logits (N)
 
-`uv sync --extra wandb`
-
-If W&B is not installed, logging will be automatically disabled without affecting model execution.
-
-These infrastructure components are provided solely for training observability and do not modify the MergeDNA modelling pipeline.
-
-## Running Outside Docker (Optional)
-
-```bash
-pip install uv
-uv sync
-pytest -q
+AMTM (4.5): Mask sampling via 1/g_i^2 from latent grouping.
 ```
-
-Docker execution is recommended to ensure matching dependency versions.
-
----
+In addition to structural unit tests, this implementation includes behavioural diagnostics aligned explicitly to the architectural components described in Sections 4.1 - 4.5 of the report.
 
 ## Contact
 
