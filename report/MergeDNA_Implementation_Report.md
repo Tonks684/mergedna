@@ -41,8 +41,7 @@ At a high level, the architecture consists of four modules:
 
 MergeDNA introduces modelling requirements not natively supported by NanoChat:
 
-- Genomic patch embeddings
-- Differentiable token merging
+- Patch-like genomic representations (implemented via differentiable local token merging)
 - Segmentation-tracking structure (S)
 - Hierarchical compression of sequence length
 
@@ -97,6 +96,26 @@ All architectural changes were introduced at the representation and input-interf
 ---
 
 ## 4. MergeDNA Module Implementations
+
+
+### Overview of Implementation
+The following subsections (4.1-4.5) describe each architectural component and its corresponding implementation details within the `mergedna/`. Each component is validated via section-aligned unit tests (see README.md Test ↔ Report Section Mapping)
+
+```
+Base Tokens (N)
+   ↓ (4.1 / 4.2)
+Local Encoder + Token Merge (4.3)
+   ↓  N → L
+Latent Encoder + Global Merge (4.4)
+   ↓  L → K
+Latent Decoder
+   ↓
+Local Decoder + Unmerge (4.3)
+   ↓
+Base Logits (N)
+
+AMTM (4.5): Mask sampling via 1/g_i^2 from latent grouping.
+```
 
 Each of the following subsections describes an architectural modification required to support MergeDNA within the NanoChat execution stack.
 
@@ -291,6 +310,8 @@ Masked base tokens are replaced with the explicit `[MASK]` token (`VOCAB.MASK`).
 - **Pros:** importance sampling focuses supervision on informative (less-merged) regions; grouping-derived masks are consistent with the model’s hierarchical structure.
 - **Cons:** introduces additional sampling and mask-projection complexity; objective becomes dependent on the quality of latent grouping $(S')$.
 
+
+The correctness of Sections 4.1-4.5 is validated via unit tests aligned explicitly to each architectural component (see repository Test ↔ Report Section Mapping)
 ---
 
 ## 5. Training Pipeline Adaptation
@@ -339,4 +360,8 @@ This modular separation enables:
 Architectural experiments on latent sequence representations can therefore be conducted without re-engineering the underlying transformer execution stack.
 
 ---
+## 9. Verification & Reproducibility
+Verification is provided via unit tests aligned to Sections 4.1–4.5 and the training contract in Section 5.
+See `README.md` (Test ↔ Report Section Mapping) and `tests/`.
 
+Optional training infrastructure (logging/checkpointing/W&B) is described in `README.md` and does not modify the MergeDNA modelling pipeline.
