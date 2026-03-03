@@ -1,3 +1,7 @@
+"""
+Simple DNA vocabulary and encoding utilities.
+"""
+
 from dataclasses import dataclass
 
 @dataclass(frozen=True)

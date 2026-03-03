@@ -1,3 +1,16 @@
+"""
+MergeDNA model components.
+
+This module implements:
+  - LocalEncoder (Section 4.3)
+  - LatentEncoder + global_merge_to_K (Section 4.4)
+  - LatentDecoder (reconstruction-only, paper pretraining)
+  - LocalDecoder + unmerge (Section 4.3)
+  - MergeDNA forward passes: MTR, Latent-MTR, AMTM (Sections 4.5 / 5.0)
+
+See report/MergeDNA_Implementation_Report.md for design rationale.
+"""
+
 from __future__ import annotations
 
 import torch
@@ -24,80 +37,179 @@ class LocalEncoder(nn.Module):
 
     def forward(self, x_emb: torch.Tensor, target_L: int) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        x_emb: (B,N,D) embedded nucleotides
+        Local Encoder E_phi (Section 4.3).
+
+        Steps:
+        1) Contextualize base-resolution token embeddings using local encoder blocks.
+        2) Perform differentiable local token merging to compress N -> L (target_L).
+        3) Return merged tokens and sparse segmentation metadata (lengths_L).
+
+        Args:
+        x_emb: (B, N, D) base token embeddings
+        target_L: desired merged length L (must be <= N)
+
         Returns:
-          z_L: (B,L,D)
-          lengths: (B,L) token lengths summing to N
+        z_L: (B, L, D) merged-token embeddings
+        lengths_L: (B, L) token span lengths, summing to N for each batch element
+                    (sufficient for unmerge + mask projection; dense S is not materialized)
         """
         B, N, D = x_emb.shape
-        lengths = torch.ones((B, N), device=x_emb.device, dtype=torch.long)  # start as single-base tokens
+        lengths = torch.ones((B, N), device=x_emb.device, dtype=torch.long)
 
         z = self.enc(x_emb)
-        # token counts are still N here. We merge down to target_L.
-        z_L, lengths_L, starts_new = self.merger(z, lengths, target_len=target_L)
-        return z_L, lengths_L
 
+        # Merge down from N to target_L tokens. Merger returns (z_L, lengths_L, starts_L).
+        # We keep starts in the interface for possible future non-trivial span metadata, but
+        # current unmerge/mask projection logic only requires lengths_L.
+        z_L, lengths_L, _starts_L = self.merger(z, lengths, target_len=target_L)
+        return z_L, lengths_L
+    
 class LatentEncoder(nn.Module):
+    """
+    MergeDNA Latent Encoder E_psi (Section 4.4) + global merge operator (L -> K).
+
+    Responsibilities:
+      1) Contextualize the locally-merged token sequence Z_L using full attention
+         (TransformerEncoder).
+      2) Produce a global bottleneck sequence Z_K of length K < L, and a sparse
+         grouping structure S' represented as group_of_token ∈ [0..K-1]^(B×L).
+
+    Paper intent:
+      - The latent stage compresses the locally-merged sequence into fewer "salient"
+        tokens, enabling global context modelling and (later) AMTM importance sampling.
+      - The paper describes a ToMe-style global merge. Here we keep the *interface and
+        training semantics* but implement a simpler anchor-based hard clustering
+        approximation, which is easy to reason about and swap out later.
+
+    Output contracts:
+      - z_K: (B, K, D)  latent / bottleneck token embeddings
+      - group_of_token: (B, L)  mapping from each local token index to its latent group
+
+    Design choice (approximation):
+      - We select K anchors using a learned grouping projection and token "importance"
+        score, then assign each token to the nearest anchor (cosine similarity).
+      - Assignments are discrete (argmax) and run under no_grad. The *aggregation*
+        into z_K is still differentiable w.r.t z_L_ctx.
+    """
+
     def __init__(self, cfg: MergeDNAConfig):
         super().__init__()
+
         enc_cfg = EncoderConfig(
             d_model=cfg.d_model,
             n_heads=cfg.n_heads,
             n_layers=cfg.n_latent_enc,
             ffn_mult=cfg.ffn_mult,
-            max_seq_len=cfg.N,  # covers L too
+            max_seq_len=cfg.N,  # enough for L (since L <= N)
         )
         self.enc = TransformerEncoder(enc_cfg)
-        # A lightweight projection for global token merging similarity
+
+        # Lightweight projection to a smaller "grouping space" used only for selecting
+        # anchors + computing similarities. Using a small dimension reduces overhead.
+        #
+        # Note: This is *not* the NanoChat tokenizer; it is an internal projection
+        # used to define merge/group structure.
         self.group = nn.Linear(cfg.d_model, 64, bias=False)
 
     def forward(self, z_L: torch.Tensor) -> torch.Tensor:
+        """
+        Full-attention contextualization of local tokens.
+
+        Args:
+          z_L: (B, L, D) locally merged token embeddings
+
+        Returns:
+          z_L_ctx: (B, L, D) contextualized embeddings
+        """
         return self.enc(z_L)
 
     def global_merge_to_K(self, z_L_ctx: torch.Tensor, K: int) -> tuple[torch.Tensor, torch.Tensor]:
         """
+        Compress a contextualized local sequence (length L) into a latent sequence (length K).
+
+        This returns a *sparse representation* of the paper's S' grouping structure:
+          - group_of_token[b, l] = k   means local token l belongs to latent group k
+
+        Args:
+          z_L_ctx: (B, L, D) contextualized local embeddings
+          K: target latent length (K < L)
+
         Returns:
-        z_K: (B,K,D)
-        group_of_token: (B,L) int64 in [0..K-1]
+          z_K: (B, K, D) latent tokens (group means)
+          group_of_token: (B, L) long in [0..K-1]
         """
         B, L, D = z_L_ctx.shape
+
+        # Edge case: if K >= L, there is no meaningful compression.
+        # We return the identity mapping (each token is its own "group").
         if K >= L:
             group = torch.arange(L, device=z_L_ctx.device).unsqueeze(0).expand(B, L)
             return z_L_ctx, group
 
-        # projection used for similarity / grouping
-        g_raw = self.group(z_L_ctx)                    # (B,L,G)
-        scores = g_raw.norm(dim=-1)                    # (B,L)  (meaningful!)
-        g = g_raw / (scores.unsqueeze(-1) + 1e-8)      # (B,L,G) normalized for cosine
+        # ---------------------------------------------------------------------
+        # 1) Project tokens into a grouping space and compute "anchor scores"
+        # ---------------------------------------------------------------------
+        # g_raw: (B, L, G)
+        g_raw = self.group(z_L_ctx)
 
-        # choose K anchors per batch by highest pre-normalization norm
-        topk_idx = torch.topk(scores, k=K, dim=1).indices  # (B,K)
+        # scores: (B, L) magnitude in grouping space; used as an "importance" proxy.
+        # We select anchors by top-K scores per batch item.
+        scores = g_raw.norm(dim=-1)
+
+        # Normalize for cosine similarity.
+        # g: (B, L, G), anchors will also be normalized -> dot = cosine sim
+        g = g_raw / (scores.unsqueeze(-1) + 1e-8)
+
+        # Choose K anchors per batch item. These are indices into the L tokens.
+        # topk_idx: (B, K)
+        topk_idx = torch.topk(scores, k=K, dim=1).indices
+
+        # Gather normalized anchor vectors:
+        # anchors: (B, K, G)
         anchors = torch.gather(
             g, 1, topk_idx.unsqueeze(-1).expand(B, K, g.size(-1))
-        )  # (B,K,G)
+        )
 
-        # assign each token to nearest anchor (cosine sim)
-        sim = torch.einsum("blg,bkg->blk", g, anchors)      # (B,L,K)
+        # ---------------------------------------------------------------------
+        # 2) Assign each token to the nearest anchor (hard clustering)
+        # ---------------------------------------------------------------------
+        # sim: (B, L, K) cosine similarity between each local token and each anchor
+        sim = torch.einsum("blg,bkg->blk", g, anchors)
+
+        # Discrete assignment. We explicitly do this under no_grad because:
+        #   - argmax is non-differentiable
+        #   - we treat the grouping as a structural routing decision, similar in spirit
+        #     to hard ToMe merges / routing.
         with torch.no_grad():
-            group_of_token = sim.argmax(dim=-1)             # (B,L)
+            group_of_token = sim.argmax(dim=-1)  # (B, L), values in [0..K-1]
 
-        # compute z_K as mean of members (vectorized)
+        # ---------------------------------------------------------------------
+        # 3) Aggregate local embeddings into latent tokens via group means
+        # ---------------------------------------------------------------------
+        # z_K is computed as the mean of all z_L_ctx assigned to each group.
+        # This keeps gradients flowing from z_K back into z_L_ctx (aggregation is differentiable),
+        # even though the assignment itself is discrete.
         z_K = torch.zeros((B, K, D), device=z_L_ctx.device, dtype=z_L_ctx.dtype)
         counts = torch.zeros((B, K), device=z_L_ctx.device, dtype=z_L_ctx.dtype)
 
-        # scatter-add embeddings
+        # Accumulate embeddings per group:
+        # scatter_add_ over dim=1 with index shape (B, L, D)
         z_K.scatter_add_(
             1,
             group_of_token.unsqueeze(-1).expand(B, L, D),
             z_L_ctx
         )
+
+        # Count members per group (for mean):
         counts.scatter_add_(
             1,
             group_of_token,
             torch.ones((B, L), device=z_L_ctx.device, dtype=z_L_ctx.dtype)
         )
 
+        # Avoid division by zero in pathological cases (should be rare but safe):
         z_K = z_K / counts.clamp_min(1.0).unsqueeze(-1)
+
         return z_K, group_of_token
 
 class LatentDecoder(nn.Module):
@@ -113,6 +225,17 @@ class LatentDecoder(nn.Module):
         self.dec = TransformerEncoder(dec_cfg)
 
     def forward(self, z_L: torch.Tensor) -> torch.Tensor:
+        """
+        Latent Decoder E_omega (paper: reconstruction-only module).
+
+        Args:
+        z_L: (B, L, D) latent-decoder input at local-token resolution.
+            In latent-MTR this is typically z_bar_L (K->L unmerge),
+            in MTR this is typically z_L_ctx.
+
+        Returns:
+        z_L_hat: (B, L, D) decoded local-token representations
+        """
         return self.dec(z_L)
 
 class LocalDecoder(nn.Module):
@@ -130,12 +253,22 @@ class LocalDecoder(nn.Module):
 
     def forward(self, z_L_hat: torch.Tensor, lengths_L: torch.Tensor, N: int) -> torch.Tensor:
         """
-        z_L_hat: (B,L,D)
-        lengths_L: (B,L) sum to N
-        Returns logits over base vocab: (B,N,V)
+        Local Decoder E_zeta (Section 4.3).
+
+        Steps:
+        1) Unmerge merged-token embeddings back to base resolution using lengths_L.
+        2) Run decoder transformer blocks at base resolution.
+        3) Produce logits over DNA vocab.
+
+        Args:
+        z_L_hat: (B, L, D) local-token representations to detokenize
+        lengths_L: (B, L) span lengths that define the sparse segmentation mapping S
+        N: base sequence length
+
+        Returns:
+        logits: (B, N, V) base-resolution logits over VOCAB
         """
-        # Unmerge merged-token embeddings back to base resolution
-        zN = unmerge_tokens(z_L_hat, lengths_L, N)  # (B,N,D)
+        zN = unmerge_tokens(z_L_hat, lengths_L, N)  # (B, N, D)
         zN = self.dec(zN)
         return self.head(rmsnorm(zN))
 
@@ -152,8 +285,19 @@ class MergeDNA(nn.Module):
 
     def forward_reconstruct(self, x: torch.Tensor, target_L: int) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Full reconstruction pass (MTR):
-          x -> local enc (merge to L) -> latent enc (full) -> latent dec -> local dec -> logits
+        MTR forward pass (Section 5.0, uses modules 4.1–4.4 + 4.3 unmerge).
+
+        Pipeline:
+        x -> embed -> LocalEncoder (N->L) -> LatentEncoder (full attention) ->
+        LatentDecoder -> LocalDecoder (L->N) -> logits
+
+        Args:
+        x: (B, N) token ids
+        target_L: merged sequence length L
+
+        Returns:
+        logits: (B, N, V)
+        lengths_L: (B, L) sparse segmentation lengths for unmerge/mask projection
         """
         x_emb = self.embed(x)
         z_L, lengths_L = self.local_encoder(x_emb, target_L=target_L)
@@ -164,9 +308,22 @@ class MergeDNA(nn.Module):
 
     def forward_latent_reconstruct(self, x: torch.Tensor, target_L: int, target_K: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Latent reconstruction pass:
-          x -> local enc (merge to L) [frozen outside] -> latent enc -> global merge to K -> unmerge to L -> latent dec -> local dec
-        Returns logits and group assignments.
+        Latent-MTR forward pass (Section 5.0; latent bottleneck is active).
+
+        IMPORTANT:
+        This method does not itself freeze LocalEncoder parameters.
+        The training loop should wrap the LocalEncoder call in torch.no_grad()
+        (or otherwise prevent gradient updates) to match the paper's objective.
+
+        Pipeline:
+        x -> embed -> LocalEncoder (N->L) -> LatentEncoder ->
+        global_merge_to_K (L->K) -> gather unmerge (K->L) ->
+        LatentDecoder -> LocalDecoder (L->N) -> logits
+
+        Returns:
+        logits: (B, N, V)
+        lengths_L: (B, L)
+        group_of_token: (B, L) latent group assignment used for AMTM probabilities
         """
         x_emb = self.embed(x)
 
@@ -231,7 +388,7 @@ class MergeDNA(nn.Module):
         _, group_of_token = self.latent_encoder.global_merge_to_K(z_L_ctx, K=target_K)
 
         # 3) Sample masks and project to base
-        sampler = AMTMMaskSampler(sampler_cfg)
+        sampler = AMTMMaskSampler(sampler_cfg)  # sampler_cfg=None => default AMTM settings
         mask_L, mask_N = sampler(group_of_token, lengths_L, N, K_groups=target_K, K_samples=target_K)
 
         # 4) Mask the base tokens
