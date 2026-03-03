@@ -66,7 +66,7 @@ docker-compose.yml
 
 ```bash
 docker compose build
-docker compose run --rm mergedna-dev pytest -q
+docker compose run --rm mergedna-dev pytest -v
 ```
 ---
 
@@ -75,7 +75,7 @@ docker compose run --rm mergedna-dev pytest -q
 ```bash
 pip install uv
 uv sync
-pytest -q
+pytest -v
 ```
 
 Docker execution is recommended to ensure matching dependency versions.
@@ -128,7 +128,7 @@ Tokenisation:
 |---------------|-----------|
 | 4.1 - 4.2 Non-causal + Local Attention | `tests/test_41_42_attention_backend.py` |
 | 4.3 Token Merge + Sparse S | `tests/test_43_local_merge_sparse_S.py` |
-| 4.3 Token Merge + Sparse S | `tests/test_43_layerwise_merge_schedule.py` |
+| 4.3 Layerwise Merging | `tests/test_43_layerwise_merge_schedule.py` |
 | 4.4 Latent Merge (L→K) | `tests/test_44_latent_merge_grouping.py` |
 | 4.5 AMTM Sampler | `tests/test_45_amtm_sampler.py` |
 | 4.5 AMTM Forward Contract | `tests/test_45_amtm_forward_contract.py` |
