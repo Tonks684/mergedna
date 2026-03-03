@@ -41,7 +41,7 @@ At a high level, the architecture consists of four modules:
 
 MergeDNA introduces modelling requirements not natively supported by NanoChat:
 
-- Patch-like genomic representations (implemented via differentiable local token merging)
+- Genomic patch embeddings (implemented via differentiable local token merging)
 - Segmentation-tracking structure (S)
 - Hierarchical compression of sequence length
 
@@ -99,7 +99,7 @@ All architectural changes were introduced at the representation and input-interf
 
 
 ### Overview of Implementation
-The following subsections (4.1-4.5) describe each architectural component and its corresponding implementation details within the `mergedna/`. Each component is validated via section-aligned unit tests (see README.md Test ↔ Report Section Mapping)
+The following subsections (4.1-4.5) describe each architectural component and its corresponding implementation details within the `mergedna/` module. Each component is validated via section-aligned unit tests (see README.md Test ↔ Report Section Mapping)
 
 ```
 Base Tokens (N)
@@ -221,7 +221,7 @@ Within each local window, the merger computes adjacency similarity in a learned 
 
 ### 4.4 Latent Bottleneck Pipeline (Global Merge L → K + Unmerge K → L)
 
-MergeDNA’s latent reconstruction and AMTM objectives require a global compression stage over the locally-merged sequence $(Z_L)$, producing a shorter sequence $(Z_K)$ with $(K < L))$, together with a grouping structure $(S')$ that enables computation of group sizes for importance-based masking.
+MergeDNA’s latent reconstruction and AMTM objectives require a global compression stage over the locally-merged sequence $(Z_L)$, producing a shorter sequence $(Z_K)$ with $(K < L)$, together with a grouping structure $(S')$ that enables computation of group sizes for importance-based masking.
 
 This implementation introduces a global merge operator that compresses $(L \rightarrow K)$ and returns a per-token group assignment vector that acts as a sparse representation of $(S')$.
 
