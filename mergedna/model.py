@@ -77,8 +77,8 @@ class LatentEncoder(nn.Module):
     Paper intent:
       - The latent stage compresses the locally-merged sequence into fewer "salient"
         tokens, enabling global context modelling and (later) AMTM importance sampling.
-      - The paper describes a ToMe-style global merge. Here we keep the *interface and
-        training semantics* but implement a simpler anchor-based hard clustering
+      - The paper describes a ToMe-style global merge. Here we keep the interface and
+        training semantics but implement a simpler anchor-based hard clustering
         approximation, which is easy to reason about and swap out later.
 
     Output contracts:
@@ -88,7 +88,7 @@ class LatentEncoder(nn.Module):
     Design choice (approximation):
       - We select K anchors using a learned grouping projection and token "importance"
         score, then assign each token to the nearest anchor (cosine similarity).
-      - Assignments are discrete (argmax) and run under no_grad. The *aggregation*
+      - Assignments are discrete (argmax) and run under no_grad. The aggregation
         into z_K is still differentiable w.r.t z_L_ctx.
     """
 
@@ -107,7 +107,7 @@ class LatentEncoder(nn.Module):
         # Lightweight projection to a smaller "grouping space" used only for selecting
         # anchors + computing similarities. Using a small dimension reduces overhead.
         #
-        # Note: This is *not* the NanoChat tokenizer; it is an internal projection
+        # Note: This is not the NanoChat tokenizer; it is an internal projection
         # used to define merge/group structure.
         self.group = nn.Linear(cfg.d_model, 64, bias=False)
 
@@ -127,7 +127,7 @@ class LatentEncoder(nn.Module):
         """
         Compress a contextualized local sequence (length L) into a latent sequence (length K).
 
-        This returns a *sparse representation* of the paper's S' grouping structure:
+        This returns a sparse representation of the paper's S' grouping structure:
           - group_of_token[b, l] = k   means local token l belongs to latent group k
 
         Args:
@@ -299,10 +299,15 @@ class MergeDNA(nn.Module):
         logits: (B, N, V)
         lengths_L: (B, L) sparse segmentation lengths for unmerge/mask projection
         """
+        # x -> embed
         x_emb = self.embed(x)
+        # LocalEncoder (N->L) -> LatentEncoder (full attention)
         z_L, lengths_L = self.local_encoder(x_emb, target_L=target_L)
+        # Contextualize with full attention before global merge.
         z_L_ctx = self.latent_encoder(z_L)
+        # LatentDecoder (reconstruction-only) -> LocalDecoder (L->N)
         z_L_hat = self.latent_decoder(z_L_ctx)
+        # LocalDecoder (L->N) -> logits
         logits = self.local_decoder(z_L_hat, lengths_L, N=x.size(1))
         return logits, lengths_L
 

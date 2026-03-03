@@ -5,10 +5,10 @@ Local token merging (MergeDNA §4.3)
 Goal:
   - Start with base-resolution token sequence z of length T (typically T == N).
   - Merge adjacent tokens inside local windows until I reach a target length L.
-  - Track the resulting segmentation *sparsely* via token_lens (and derived starts).
+  - Track the resulting segmentation sparsely via token_lens (and derived starts).
 Representation / invariants:
   - token_lens[b, l] is the number of base tokens covered by merged token l.
-  - Merges are *adjacent* only, so every merged token corresponds to a contiguous span.
+  - Merges are adjacent only, so every merged token corresponds to a contiguous span.
   - Starts are derivable by cumulative sum:
         starts = cumsum(lens) - lens
   - This is a run-length encoding of the paper's dense S ∈ {0,1}^{L×N}.

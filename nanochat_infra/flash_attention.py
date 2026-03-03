@@ -6,7 +6,7 @@ Unified FlashAttention interface with automatic FA3/SDPA switching.
 Goal
 ----
 Expose an API compatible with FlashAttention-3 (FA3) while allowing the codebase
-to run on *any* device (non-Hopper CUDA GPUs, CPU, MPS) by falling back to
+to run on any device (non-Hopper CUDA GPUs, CPU, MPS) by falling back to
 PyTorch's scaled_dot_product_attention (SDPA).
 
 This module exports a `flash_attn` object (SimpleNamespace) with:
