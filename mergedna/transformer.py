@@ -277,3 +277,25 @@ class TransformerEncoder(nn.Module):
         for blk in self.blocks:
             x = blk(x, cos, sin)
         return x
+
+    def forward_range(self, x: torch.Tensor, start: int, end: int) -> torch.Tensor:
+      """
+      Forward a contiguous subset of encoder blocks [start, end).
+
+      This is used by MergeDNA LocalEncoder to interleave:
+        (some local blocks) -> merge -> (some local blocks) -> merge -> ...
+
+      Args:
+        x: (B, T, D)
+        start: inclusive block index
+        end: exclusive block index
+
+      Returns:
+        x: (B, T, D) after applying blocks[start:end]
+      """
+      assert 0 <= start <= end <= len(self.blocks), (start, end, len(self.blocks))
+
+      cos, sin = self.rope.get(x.size(1), x.device, x.dtype)
+      for blk in self.blocks[start:end]:
+          x = blk(x, cos, sin)
+      return x
