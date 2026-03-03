@@ -175,54 +175,94 @@ Trade-off:
 - Reduces global receptive field within Local Encoder blocks
 - Optimized FlashAttention execution is preserved when available via NanoChat’s runtime dispatch.
 ---
-### 4.3 Token Merging + Segmentation Mapping
 
-MergeDNA’s Local Encoder performs local token merging and produces both a compressed token sequence $(Z_L)$ and a segmentation-tracking structure $(S)$ that supports reconstruction and mask projection back to base resolution.
+### 4.3 Token Merging + Segmentation Mapping (Layer-wise)
 
-Rather than materialising the paper’s dense binary source matrix $(S \in \{0,1\}^{L \times N})$, this implementation uses a sparse run-length encoding of the segmentation, which is sufficient to support:
+MergeDNA’s Local Encoder performs **progressive, layer-wise token merging**, interleaved with local self-attention blocks.
 
-1) **Unmerge** of embeddings back to base resolution  
-2) **Projection** of merged-token masks back to base masks (required by AMTM)
+Rather than applying a single merge operation after all local layers, this implementation interleaves:
+
+Local attention blocks → merge → local attention → merge → ... → final $Z_L$
+
+At each merge stage, the sequence length is reduced according to a deterministic merge schedule that ensures the final length equals the requested target $L$. This preserves the hierarchical tokenization dynamics described in the paper.
+
+---
+
+#### Sparse Segmentation Representation
+
+The paper defines a dense source matrix:
+
+$$
+S \in \{0,1\}^{L \times N}
+$$
+
+mapping base tokens to merged tokens.
+
+Materializing this matrix is impractical for long sequences (e.g., $N = 4096$).  
+Instead, this implementation uses a **sparse run-length encoding** that fully determines the same mapping:
+
+- `token_lens ∈ ℤ^{B × L}` — span length of each merged token  
+- `token_starts ∈ ℤ^{B × L}` — starting base index of each span  
+
+This representation is:
+
+- Memory-efficient: $O(L)$ rather than $O(LN)$  
+- Exact for contiguous merges  
+- Composable across multiple merge stages  
+
+Unit tests validate equivalence to a dense $S$ reference for small sequences.
 
 
-Materialising the paper’s dense $(S)$ is unnecessary and impractical for long sequences because each merged token corresponds to a contiguous span of tokens determined by token lengths and token starts.
+---
 
-#### Implementation locations
+#### Merge Behaviour (Per Stage)
 
-- `mergedna/local_merge.py::LocalTokenMerger`  
-- `mergedna/local_merge.py::unmerge_tokens`  
-- `mergedna/local_merge.py::project_mask_to_base`
+Within each merge stage:
 
-#### Representation of segmentation (sparse “S”)
+1. Tokens are projected into a learned grouping space.
+2. Adjacent token similarities are computed within fixed local windows.
+3. A set of **non-overlapping adjacent pairs** is selected (merge budget).
+4. Each selected right token is merged into its left neighbor using span-weighted averaging:
+   - embeddings combined proportionally to `token_lens`
+   - lengths accumulated
 
-Segmentation is represented by two per-token vectors:
+Non-overlapping merges ensure:
 
-- `token_lens` $(\in \mathbb{Z}^{B \times L})$: base span length covered by each merged token  
-- `token_starts` $(\in \mathbb{Z}^{B \times L})$: base start index for each merged token span  
+- Each base token belongs to exactly one merged token.
+- Segmentation structure remains well-defined.
+- Progressive merging remains stable across layers.
 
-This representation is memory-efficient $(O(L)$ rather than $O(LN))$ while preserving exact reconstruction and masking behaviour, as validated by unit tests that compare against a dense $(S)$ reference for small sequences.
+Although the MergeDNA paper does not explicitly state “non-overlapping” constraints, this is inherent in pairwise merging semantics and aligns with the ToMe merging strategy.
 
+---
 
-#### Merge behaviour
+#### Unmerge and Mask Projection
 
-Within each local window, the merger computes adjacency similarity in a learned grouping space and selects a set of **non-overlapping adjacent pairs** to merge, subject to a target length $(L)$ (merge budget). Merges are applied as a span-weighted average:
+The sparse representation supports:
 
-- right token is merged into the left token embedding
-- lengths are accumulated to preserve span accounting (`token_lens`)
+**Unmerge**
 
-Although the paper does not explicitly state the need for non-overlapping adjacent pairs it is a requirement for pairwise merging and is mentioned in the ToMe paper. Core idea being that each original token must belong to exactly one merged token therefore it cannot be merged twice.
+`unmerge_tokens(z_L, token_lens, N)`
 
-#### Unmerge and mask projection
+Repeats each merged embedding over its base span.
 
-- **Unmerge:** `unmerge_tokens(z_L, token_lens, N)` repeats each merged embedding over its base span  
-- **Mask projection:** `project_mask_to_base(mask_L, token_lens, N)` repeats merged-token boolean masks over their base spans
+**Mask projection**
+
+`project_mask_to_base(mask_L, token_lens, N)`
+
+Repeats merged-token masks over their spans.
+
+Both operations are exact under contiguous span merges.
+
+---
 
 #### Trade-offs
 
-- **Pros:** avoids dense $(S)$; deterministic and efficient unmerge/mask projection; clean integration into training loops.  
-- **Cons:** assumes merged groups are contiguous spans (valid for adjacent merges); if later variants introduce non-contiguous grouping, additional metadata would be required.
-
----
+| Design choice | Benefit | Cost |
+|---------------|---------|------|
+| Sparse span encoding instead of dense $S$ | Memory efficient and simple | Assumes contiguous merges |
+| Layer-wise progressive merging | Closer to paper, hierarchical dynamics | Slightly more complex control flow |
+| Deterministic merge schedule | Stable and reproducible | Fixed schedule rather than adaptive per-layer $r_\ell$ |
 
 ## 4.4 Latent Bottleneck Pipeline (Global Merge L → K + Unmerge K → L)
 

@@ -13,6 +13,7 @@ See report/MergeDNA_Implementation_Report.md for design rationale.
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,39 +32,69 @@ class LocalEncoder(nn.Module):
             n_layers=cfg.n_local_enc,
             ffn_mult=cfg.ffn_mult,
             max_seq_len=cfg.N,
+            attn_window_size=(cfg.local_window_size, cfg.local_window_size),
         )
         self.enc = TransformerEncoder(enc_cfg)
         self.merger = LocalTokenMerger(cfg.d_model, LocalMergeConfig(window_size=cfg.local_window_size))
 
     def forward(self, x_emb: torch.Tensor, target_L: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Local Encoder E_phi (Section 4.3).
-
-        Steps:
-        1) Contextualize base-resolution token embeddings using local encoder blocks.
-        2) Perform differentiable local token merging to compress N -> L (target_L).
-        3) Return merged tokens and sparse segmentation metadata (lengths_L).
-
-        Args:
-        x_emb: (B, N, D) base token embeddings
-        target_L: desired merged length L (must be <= N)
-
-        Returns:
-        z_L: (B, L, D) merged-token embeddings
-        lengths_L: (B, L) token span lengths, summing to N for each batch element
-                    (sufficient for unmerge + mask projection; dense S is not materialized)
-        """
         B, N, D = x_emb.shape
         lengths = torch.ones((B, N), device=x_emb.device, dtype=torch.long)
+        z = x_emb
 
-        z = self.enc(x_emb)
+        n_layers = self.enc.cfg.n_layers
+        # Minimal default: 2 merges if we have enough layers, otherwise fewer.
+        n_merges = min(2, max(0, n_layers - 1))  # ensures we always have at least 1 block after final merge
 
-        # Merge down from N to target_L tokens. Merger returns (z_L, lengths_L, starts_L).
-        # We keep starts in the interface for possible future non-trivial span metadata, but
-        # current unmerge/mask projection logic only requires lengths_L.
-        z_L, lengths_L, _starts_L = self.merger(z, lengths, target_len=target_L)
-        return z_L, lengths_L
-    
+        # If no merges requested, just run full local encoder and return (no compression)
+        if n_merges == 0:
+            z = self.enc(z)
+            return z, lengths
+
+        schedule_L = self.linear_merge_schedule(N, target_L, n_merges)  # len == n_merges
+
+        # Partition layers into (n_merges + 1) segments with guaranteed non-empty segments.
+        n_segments = n_merges + 1
+        seg_sizes = [n_layers // n_segments] * n_segments
+        for i in range(n_layers % n_segments):
+            seg_sizes[i] += 1
+
+        boundaries = [0]
+        for sz in seg_sizes:
+            boundaries.append(boundaries[-1] + sz)
+        # boundaries length = n_segments+1, ends at n_layers
+
+        for seg_idx in range(n_segments):
+            s, e = boundaries[seg_idx], boundaries[seg_idx + 1]
+            z = self.enc.forward_range(z, s, e)
+
+            # Merge after this segment if we still have merges remaining
+            if seg_idx < n_merges:
+                z, lengths, _starts = self.merger(z, lengths, target_len=schedule_L[seg_idx])
+
+        # Ensure exact final length
+        if z.size(1) != target_L:
+            z, lengths, _starts = self.merger(z, lengths, target_len=target_L)
+
+        return z, lengths
+
+    @staticmethod
+    def linear_merge_schedule(N: int, target_L: int, n_merges: int) -> list[int]:
+        """
+        Monotone schedule of intermediate lengths ending at target_L.
+
+        Example:
+          N=4096, target_L=2048, n_merges=2 -> [3072, 2048]
+        """
+        if n_merges <= 0:
+            return []
+        steps = []
+        for i in range(1, n_merges + 1):
+            Li = int(round(N - (N - target_L) * (i / n_merges)))
+            steps.append(max(target_L, min(N, Li)))
+        steps[-1] = target_L
+        return steps
+        
 class LatentEncoder(nn.Module):
     """
     MergeDNA Latent Encoder E_psi (Section 4.4) + global merge operator (L -> K).
@@ -148,6 +179,7 @@ class LatentEncoder(nn.Module):
 
         # ---------------------------------------------------------------------
         # 1) Project tokens into a grouping space and compute "anchor scores"
+        # This is a learned projection into a low-dimensional grouping space.
         # ---------------------------------------------------------------------
         # g_raw: (B, L, G)
         g_raw = self.group(z_L_ctx)
@@ -161,6 +193,7 @@ class LatentEncoder(nn.Module):
         g = g_raw / (scores.unsqueeze(-1) + 1e-8)
 
         # Choose K anchors per batch item. These are indices into the L tokens.
+        # Tokens with larger projection magnitude are more salient.
         # topk_idx: (B, K)
         topk_idx = torch.topk(scores, k=K, dim=1).indices
 
@@ -247,6 +280,7 @@ class LocalDecoder(nn.Module):
             n_layers=cfg.n_local_dec,
             ffn_mult=cfg.ffn_mult,
             max_seq_len=cfg.N,
+            attn_window_size=(cfg.local_window_size, cfg.local_window_size),
         )
         self.dec = TransformerEncoder(dec_cfg)
         self.head = nn.Linear(cfg.d_model, VOCAB.size, bias=False)
