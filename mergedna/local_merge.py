@@ -66,56 +66,44 @@ class LocalTokenMerger(nn.Module):
             nn.Linear(cfg.group_dim, cfg.group_dim, bias=False),
         )
 
-    @torch.no_grad()
-    def _choose_nonoverlap_pairs(self, sim_adj: torch.Tensor, merge_budget: int) -> torch.Tensor:
+    def _choose_nonoverlap_pairs_tome_adjacent(
+        self, sim_adj: torch.Tensor, merge_budget: int, offset: int = 0
+    ) -> torch.Tensor:
         """
-        Select which adjacent edges to merge inside ONE window.
+        ToMe-style bipartite selection specialized to ADJACENT edges only.
 
-        Args:
-            sim_adj:
-                (W-1,) similarity score for each adjacent edge (i, i+1) within window.
-            merge_budget:
-                maximum number of merges to perform in this window.
+        Taken from https://arxiv.org/pdf/2210.09461 
 
-        Returns:
-            merge_right:
-                (W,) bool mask where merge_right[j] = True means:
-                    "merge token j into token j-1".
-                I merge "right into left" to keep merges contiguous and simple.
-
-        Constraint:
-            Pairs must be non-overlapping: if I merge (i,i+1) I cannot also merge
-            (i-1,i) or (i+1,i+2). This is enforced via the `used` mask.
-
-        Note:
-            This selection is discrete; I do it under no_grad for simplicity and
-            to keep the merge schedule deterministic given similarity scores.
+        sim_adj: (W-1,) similarity for edges (i,i+1) within the window.
+        Returns merge_right: (W,) bool where merge_right[j]=True means merge j into j-1.
         """
         W = sim_adj.numel() + 1
-        merge_right = torch.zeros(W, dtype=torch.bool, device=sim_adj.device)
-        used = torch.zeros(W, dtype=torch.bool, device=sim_adj.device)
+        device = sim_adj.device
 
-        # Consider edges from most-similar to least-similar.
-        order = torch.argsort(sim_adj, descending=True)
+        merge_right = torch.zeros(W, dtype=torch.bool, device=device)
 
-        picked = 0
-        for e in order.tolist():
-            if picked >= merge_budget:
-                break
+        # left indices for edges (i, i+1)
+        edge_left = torch.arange(0, W - 1, device=device)
 
-            # edge e corresponds to pair (i, j=i+1)
-            i, j = e, e + 1
+        # ToMe-style partition: choose edges where left index parity matches offset
+        # offset = 0 → edges (0,1), (2,3), ...
+        # offset = 1 → edges (1,2), (3,4), ...
+        allowed = (edge_left % 2 == offset)
 
-            # Skip if either endpoint already used in a previous merge.
-            # Enforcing non-overlapping pairs here
-            if used[i] or used[j]:
-                continue
+        candidate_edges = edge_left[allowed]
+        candidate_scores = sim_adj[candidate_edges]
 
-            # Mark merge: right token j folds into left token i.
-            merge_right[j] = True
-            used[i] = True
-            used[j] = True
-            picked += 1
+        if candidate_edges.numel() == 0:
+            return merge_right
+
+        k = min(merge_budget, candidate_edges.numel())
+
+        # pick top-k edges by similarity
+        topk = torch.topk(candidate_scores, k=k).indices
+        chosen_left = candidate_edges[topk]
+        chosen_right = chosen_left + 1
+
+        merge_right[chosen_right] = True
 
         return merge_right
 
@@ -124,6 +112,7 @@ class LocalTokenMerger(nn.Module):
         z: torch.Tensor,
         token_lens: torch.Tensor,
         target_len: int,
+        offset: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Merge base-resolution tokens down to `target_len`.
@@ -135,6 +124,7 @@ class LocalTokenMerger(nn.Module):
                 (B, T) int64 span lengths (usually all ones at base resolution).
             target_len:
                 desired output length L.
+            offset: enables alternate partition switching even and odd.
 
         Returns:
             z_new:
@@ -217,7 +207,7 @@ class LocalTokenMerger(nn.Module):
                 local = sim_all[b, s : e - 1]
 
                 # Choose which right-tokens inside the window get merged.
-                mr = self._choose_nonoverlap_pairs(local, budget)  # (e-s,)
+                mr = self._choose_nonoverlap_pairs_tome_adjacent(local, budget,offset=offset)
 
                 # Convert local window indices to global indices in [0..T-1].
                 idx = torch.nonzero(mr, as_tuple=False).flatten() + s

@@ -26,9 +26,15 @@ def test_local_encoder_layerwise_merging_calls_merger_multiple_times(monkeypatch
     called_target_lens = []
     orig_forward = enc.merger.forward
 
-    def wrapped_forward(z, token_lens, target_len: int):
-        called_target_lens.append(int(target_len))
-        return orig_forward(z, token_lens, target_len=target_len)
+    def wrapped_forward(*args, **kwargs):
+        # args: (z, token_lens, target_len) if called positionally
+        # kwargs: may include target_len, offset
+        if "target_len" in kwargs:
+            tl = int(kwargs["target_len"])
+        else:
+            tl = int(args[2])
+        called_target_lens.append(tl)
+        return orig_forward(*args, **kwargs)
 
     monkeypatch.setattr(enc.merger, "forward", wrapped_forward)
 
