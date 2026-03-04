@@ -111,6 +111,7 @@ Using NanoChat as the execution backend preserves the following properties:
 The following subsections (4.1-4.5) describe each architectural component and its corresponding implementation details within the `mergedna/` module. Each component is validated via section-aligned unit tests (see README.md Test ↔ Report Section Mapping)
 
 **Notation**  
+
 $N$: base token length. \
 $L$: locally merged length. \
 $K$: latent bottleneck length. \
@@ -142,6 +143,7 @@ Each of the following subsections describes an architectural modification requir
 ### 4.1 Non-Causal Transformer Execution
 
 **Overview**
+
 MergeDNA pre-training objectives (MTR, AMTM) require reconstruction-style attention rather than autoregressive next-token prediction. This means attention must run with causal masking disabled.
 
 **Implementation locations**
@@ -169,17 +171,20 @@ out = F.scaled_dot_product_attention(qh, kh, vh, is_causal=False)
 where `causal=False`.
 
 **Design choices**
-**From paper**
+
+From paper
 - Reconstruction-style (non-autoregressive) attention is required for the reconstruction objectives used in MergeDNA pre-training.
 
-**Assumptions / engineering choices**
+Assumptions / engineering choices
 - Reuse Nanochat FlashAttention-2/FA3 runtime dispatch when present otherwise implement SDPA fallback with Pytorch.
 - Reuse Nanochat rotary embedding, RMSnorm and distributed execution support.
 
 **Verification**
+
 - `tests/test_41_42_attention_backend.py`
 
 **Trade-offs**
+
 - **Benefit**: Preserves high-performance attention dispatch (FA/SDPA) while matching reconstruction semantics
 - **Cost**: Requires careful masking logic 
 ---
@@ -187,6 +192,7 @@ where `causal=False`.
 ### 4.2 Local-Window Attention Module
 
 **Overview**
+
 MergeDNA’s local stages(Local Encoder and Local Decoder) operate under **fixed-window locality constraints**. This requires **sliding-window attention masks** rather than full global attention.
 
 **Implementation locations**
@@ -234,15 +240,18 @@ mask = _sdpa_bool_mask(
 ```
 **Design choices**
 
-**From paper**
+From paper
 - Local stages are locality-constrained (eg. window size 16 in the reported configuration)
-**Assumptions / engineering choices**
+
+Assumptions / engineering choices
 - Implement local attention via the same unified backend interface so the rest of the model does not depend on which attention kernel is used.
 
 **Verification**
+
 - `tests/test_41_42_attention_backend.py`
 
-**Trade-off**:
+**Trade-off**
+
 - **Benefit**: Correct locality semantics with a single attention interface, compatible with FA dispatch where available.
 - **Cost**: SDPA fallback requires mask construction, which can be slower than kernel native sliding window attention.
 ---
@@ -250,6 +259,7 @@ mask = _sdpa_bool_mask(
 ### 4.3 Token Merging + Segmentation Mapping (Layer-wise)
 
 **Overview**
+
 The core merging logic is implemented in `mergedna/local_merge.py`, while the merge scheduling and interleaving with the transformer encoder are implemented in `mergedna/model.py::LocalEncoder`.
 
 MergeDNA’s Local Encoder performs **progressive, layer-wise token merging**, interleaved with local self-attention blocks.
@@ -276,6 +286,7 @@ This preserves the hierarchical tokenization dynamics described in the paper.
 **Implementation details**
 
 **Layerwise merge scheduling & encoder interleaving**
+
 The local encoder partitions transfomer layers into `n_segments = n_merges +1` segments, forwards each segment, then merges to the next scheduled length before continuing. The schedule is deterministic and ends at `target_L`.
 Below is a snippet from `mergedna/model.py::LocalEncoder.forward` showing the layer-wise compression, merge schedule and the use of `offset` for ToMe-style alternating between even and odd.
 ```python
@@ -294,6 +305,7 @@ for seg_idx in range(n_segments):
 This implements the layer-wise progressive compression described in the paper.
 
 **Deterministic merge length schedule (N -> L)**
+
 The paper describes progressive merging but does not specify the exact intermediate lengths or budgeting strategy per layer segment. This reproduction uses a simple linear schedule to produce intermediate targets `L_1...L_m` ending at `target_L`.
 
 ```python
@@ -315,6 +327,7 @@ def linear_merge_schedule(N: int, target_L: int, n_merges: int) -> list[int]:
 ```
 
 **Collision-free merge pair selection**
+
 To prevent overlap (a token being merged twice in the same stage), the candidate adjacent edges are restricted using a bipartite parity split ("offset") as mentioned above. This alternates between stages:
 | Merge stage | Allowed pairs |
 |--------------|---------------|
@@ -363,6 +376,7 @@ merge_right[chosen_right] = True
 ---
 
 **Span-weighted merge update and token span tracking**
+
 The paper defines a dense source matrix $S$ mapping base tokens to merged tokens. Materialising dense `S` is impractical for long sequences (e.g., $N = 4096$).  
 Instead, this implementation uses a **sparse run-length encoding** that fully determines the same base -> local mapping under contiguous-span merges:
 
@@ -418,6 +432,7 @@ This span-weighted merge (4a.) preserves proportional contribution from larger s
 `token_starts` is derived from `token_lens` and is not required for unmerge/mask projection in the current implementation, but it is kept for completeness and potential future span logic.
 
 **Sparse segmentation utilities**
+
 Primary snippets for implementing the sparse `S` from:
 `mergedna/local_merge.py::unmerge_tokens`
 ```python
@@ -432,12 +447,12 @@ These operations are equivalent to multiplying by `S^T` (unmerge) and `S`-projec
 
 ---
 
-#**Design choices**
-**From paper**
+**Design choices**
 
+From paper
 - Layer-wise progressive merging
 
-**Assumptions / engineering choices**
+Assumptions / engineering choices
 - Linear merge schedule (paper doesn’t specify exact intermediate lengths)
 - Alternating bipartite merge selection
 - Sparse span encoding instead of dense $(S)$
@@ -455,6 +470,7 @@ These operations are equivalent to multiplying by `S^T` (unmerge) and `S`-projec
 ---
 
 **Verification**
+
 - `tests/test_43_layerwise_merge_schedule.py`
 - `tests/test_43_local_merge_sparse_S.py`
 - `tests/test_43_local_merge_tome_offset.py`
@@ -599,12 +615,12 @@ Each local token retrieves the embedding of its assigned latent group.
 
 **Design choices**
 
-**From paper**
+From paper
 
 - A global latent bottleneck compressing $Z_L$ into $Z_K$
 - Hard grouping structure $S'$ used for AMTM importance sampling
 
-**Assumptions / engineering choices**
+Assumptions / engineering choices
 
 - Anchor-based clustering rather than ToMe pairwise merging
 - Hard assignment via argmax rather than soft clustering
@@ -741,6 +757,7 @@ The correctness of Sections 4.1-4.5 is validated via unit tests aligned explicit
 ---
 
 ## 5. Parameter Accounting (~380M parameters)
+
 The configuration used in this implementation corresponds to the ~380M parameter setting described in Section 4 of the paper. The dominant contribution to parameter count arises from the Transformer blocks.
 
 The architecture comprises:
@@ -783,6 +800,7 @@ This estimate assumes:
 ## 6. Training Pipeline Adaptation
 
 **Overview**
+
 The training loop modified to support:
 
 - Three forward-pass objective computation  
@@ -810,6 +828,7 @@ L_total = L_MTR(θ) + λ L_MTR(θ \ {ϕ}) + L_AMTM(θ)
 ---
 
 ## 8. Verification & Reproducibility
+
 Verification is provided via unit tests aligned to Sections 4.1–4.5 and the training contract described in Section 6.
 
 See:
@@ -828,6 +847,7 @@ These tests validate:
 ---
 
 ## 9. Extensibility
+
 The modular separation between:
 
 - token merging
