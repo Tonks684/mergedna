@@ -385,7 +385,14 @@ Instead, this implementation uses a **sparse run-length encoding** that fully de
 
 This representation is:
 
-- Memory-efficient: $O(L)$ rather than $O(LN)$  
+- Memory-efficient: $O(L)$ rather than $O(LN)$ where N = no. base tokens, L no. mergerd tokens.
+    - $O(LN)$ would store every base to merged relationship
+    - Typically N = 4096 and L $\appox$ 2058 = 8.4M per batch
+    - Using contiguous spans instead of dense 'S' gives $O(L)$
+        - Because merges are restricted to adjacent tokens, every merged token corresponds to a neighboring interval of base tokens: $[start_i, start_i_ len_i]$.
+        - This also enables Unmerge tokens and mask projection ot happen in $O(L)$. 
+        - Means the entire mapping can be reconstructed from two vectors of length L per batch.
+    - If non-adjacent merges where required this would need a rethink!
 - Exact for contiguous merges  
 - Composable across multiple merge stages  
 

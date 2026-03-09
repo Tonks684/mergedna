@@ -71,7 +71,7 @@ class LocalEncoder(nn.Module):
             # Merge after this segment if we still have merges remaining
             offset = seg_idx % 2  # alternate merge partitions: even, then odd, then even...
             if seg_idx < n_merges:
-                z, lengths, _starts = self.merger(z, lengths, target_len=schedule_L[seg_idx],offset=offset)
+                z, lengths, _starts = self.merger(z, lengths, target_len=schedule_L[seg_idx], offset=offset)
 
         # Ensure exact final length
         offset = n_merges % 2  # If we already hit target_L, this will be a no-op.
