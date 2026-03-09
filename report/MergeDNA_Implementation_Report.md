@@ -548,7 +548,8 @@ This selects the top-k tokens in grouping space as cluster anchors.
 
 **3. Hard Assignment via Cosine Similarity**
 
-All local tokens are assigned to their nearest anchor by cosine similarity: $\text{group\_of\_token}[l] = \arg\max_k \langle g_l, g_{\text{anchor},k} \rangle$
+All local tokens are assigned to their nearest anchor by cosine similarity: 
+$$\text{group\_of\_token}[l] = \arg\max_k \langle g_l, g_{\text{anchor},k} \rangle$$
 
 ```python
 sim = torch.einsum("blg,bkg->blk", g, anchors)
